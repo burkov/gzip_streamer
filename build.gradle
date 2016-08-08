@@ -1,4 +1,4 @@
-group 'eu.exante.streamer'
+group 'com.github.burkov.nginx.gzip_streamer'
 version '1.0-SNAPSHOT'
 
 buildscript {

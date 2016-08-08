@@ -1,9 +1,29 @@
 package com.github.burkov.nginx.gzip_streamer
 
-import java.io.*
-import java.nio.file.FileSystems
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
+import java.io.File
+import java.io.FileReader
+import java.io.InputStreamReader
+
+private fun Long.bytes(signed: Boolean = false): String {
+    val sign = if (this < 0) -1 else 1
+    var r = Math.abs(this.toDouble())
+    var p = 0
+    while (r >= 1000) {
+        r /= 1000
+        p++
+    }
+    val map = mapOf(
+            1 to "kB",
+            2 to "MB",
+            3 to "GB",
+            4 to "TB"
+    )
+    return if(signed)
+        if (p == 0) "%+7d  b".format(this) else "${"%+7.2f".format(r * sign)} ${map[p]}"
+    else
+        if (p == 0) "%7d  b".format(this) else "${"%7.2f".format(r * sign)} ${map[p]}"
+
+}
 
 private fun checkOutput(command: String, errorMessage: String): List<String> {
     val process = Runtime.getRuntime().exec(command)
@@ -11,7 +31,7 @@ private fun checkOutput(command: String, errorMessage: String): List<String> {
     return InputStreamReader(process.inputStream).readLines()
 }
 
-private fun startNginx(nginxPath: String, nginxConfig: String): List<Int> {
+private fun startNginx(nginxPath: String, nginxConfig: String): Pair<Process, List<Int>> {
     fun pollFile(path: String, pollInterval: Long = 300, maxAttempts: Int = 10): File {
         require(maxAttempts > 0 || pollInterval > 0)
         val file = File(path)
@@ -20,7 +40,7 @@ private fun startNginx(nginxPath: String, nginxConfig: String): List<Int> {
             if (file.exists()) return file
             Thread.sleep(pollInterval)
         }
-        throw Exception("polling of $path failed ($maxAttempts attempts every $pollInterval ms)")
+        throw Exception("polling of '$path' failed ($maxAttempts attempts every $pollInterval ms)")
     }
 
     fun getWorkersPids(parentPid: Int): List<Int> {
@@ -28,27 +48,24 @@ private fun startNginx(nginxPath: String, nginxConfig: String): List<Int> {
                 .map { it.trim().toInt() }
     }
 
+    val command = "$nginxPath -p . -c $nginxConfig"
+    val pb = ProcessBuilder(command.split(" "))
+    pb.redirectErrorStream(true)
+    pb.redirectOutput(ProcessBuilder.Redirect.to(File("nginx.out.log")))
     try {
-        val process = Runtime.getRuntime().exec("$nginxPath -p . -c $nginxConfig")
+        val process = pb.start()
         val pid = FileReader(pollFile("nginx.pid")).readText().trim().toInt()
-        val workersPids = getWorkersPids(pid)
-        Thread {
-            process.waitFor()
-            // unreachable
-            listOf(process.inputStream to "nginx.out.log", process.errorStream to "nginx.err.log").forEach {
-                Files.copy(it.first, FileSystems.getDefault().getPath(it.second), StandardCopyOption.REPLACE_EXISTING)
-            }
-            println("nginx stopped unexpectedly, see nginx.{out|err}.log")
-            System.exit(1)
-        }.start()
-        return workersPids
+        val workers = getWorkersPids(pid)
+        println("nginx started, pid: $pid, workers: $workers (output redirected to 'nginx.out.log', pidfile: 'nginx.pid')")
+        return process to workers
     } catch (e: Exception) {
-        println("failed to start nginx")
-        throw e
+        println("failed to start nginx with `$command`: ${e.message}")
+        System.exit(1)
+        throw e // unreachable
     }
 }
 
-class StatPrinter(val workersPids: List<Int>, val clientFactory: DevRandomClientFactory) {
+class StatPrinter(val workersPids: List<Int>) {
     private var lastRss = 0L
 
     private fun getRssBytes(pids: List<Int>): Long {
@@ -60,37 +77,54 @@ class StatPrinter(val workersPids: List<Int>, val clientFactory: DevRandomClient
     fun print() {
         val currentRss = getRssBytes(workersPids)
         val rssDiff = currentRss - lastRss
-        if (lastRss != 0L && rssDiff != 0L) println(" (${if (rssDiff > 0) "+" else ""}${rssDiff.bytes()})")
+        if (lastRss != 0L && rssDiff != 0L) println(" ${rssDiff.bytes(true)}")
         lastRss = currentRss
-        val conns = clientFactory.connectedClients.sum()
-        val total = clientFactory.totalBytesReceived.sum().bytes()
-        print("\r$conns connections, rcvd: $total, rss: ${currentRss.bytes()}")
+        print("\rtotal rss: ${currentRss.bytes()}")
     }
 }
 
+private fun startServer(server: DevRandomServer): Thread {
+    val cf = server.waitBind()
+    return Thread {
+        try {
+            cf.channel().closeFuture().sync()
+        } finally {
+            println("stream server exited")
+            server.shutdown()
+        }
+    }.apply { start() }
+}
+
 fun main(args: Array<String>) {
-    val nginxConfig = (args.firstOrNull() ?: "nginx.conf")
-    val nginxPath = (args.drop(1).firstOrNull() ?: "/usr/local/bin/nginx")
-    val numberOfClients = (args.drop(2).firstOrNull() ?: "1").toInt()
-
+    println("usage: gzip_streamer.jar [nginx] [config]")
+    val nginxPath = (args.firstOrNull() ?: "/usr/sbin/nginx")
+    val configPath = (args.drop(1).firstOrNull() ?: "nginx.conf")
     val pollInterval = 3000L
-    val serverPort = 8081
-    val nginxRelayPort = 8080
-    val clientFactory = DevRandomClientFactory()
 
-    val workersPids = startNginx(nginxPath, nginxConfig)
-    Thread { DevRandomServer().run(serverPort) }.start()
-    clientFactory.attachClients(numberOfClients, nginxRelayPort)
-    val sp = StatPrinter(workersPids, clientFactory)
+    println("nginx executable  = $nginxPath")
+    println("nginx config      = $configPath")
+    println("rss poll interval = $pollInterval ms\n")
+
+    val serverWatchdog = startServer(DevRandomServer())
+
+    val (process, workers) = startNginx(nginxPath, configPath)
+    Runtime.getRuntime().addShutdownHook(Thread {
+        process.destroy()
+        process.waitFor()
+        process.destroyForcibly() // make sure nginx is stopped
+    })
+    val sp = StatPrinter(workers)
+
+    println("now you should start client (e.g `curl -H 'Accept-Encoding: gzip' -v http://localhost:8080/stream 1>/dev/null`)")
 
     try {
-        while (true) {
+        while (process.isAlive && serverWatchdog.isAlive) {
             sp.print()
             Thread.sleep(pollInterval)
         }
     } catch (e: Exception) {
         e.printStackTrace()
-        System.exit(1)
+    } finally {
+        System.exit(1) // stop other threads (if any)
     }
-
 }
