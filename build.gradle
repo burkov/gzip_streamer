@@ -20,9 +20,8 @@ repositories {
 
 dependencies {
     compile "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_version"
-    compile group: 'org.asynchttpclient', name: 'async-http-client', version: '2.0.11'
+    compile group: 'io.netty', name: 'netty-all', version: '4.0.39.Final'
     compile group: 'org.slf4j', name: 'slf4j-simple', version: '1.7.21'
-
 }
 
 jar {
