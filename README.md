@@ -2,11 +2,8 @@
 Test application which show problem in nginx gzip filter module
 
 
-To compile use `./run.sh`
-
-Then run with:
+To compile & run use `./run.sh`:
 ```
-$ java -jar build/libs/gzip_streamer-1.0-SNAPSHOT.jar $(which nginx)
 usage: gzip_streamer.jar [nginx] [config]
 nginx executable  = /usr/sbin/nginx
 nginx config      = nginx.conf
