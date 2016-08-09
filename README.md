@@ -1,5 +1,5 @@
 # gzip_streamer
-Test application which show problem in nginx gzip filter module (`https://trac.nginx.org/nginx/ticket/1046`)
+Test application which show [problem](https://trac.nginx.org/nginx/ticket/1046) in nginx gzip filter module 
 
 
 To compile & run use `./run.sh`:
